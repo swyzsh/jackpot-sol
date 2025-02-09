@@ -64,6 +64,7 @@ pub mod jackpot_program {
   pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
     let pot = &mut ctx.accounts.pot;
     let clock = Clock::get()?;
+
     require!(pot.game_state == GameState::Active, ErrorCode::GameInactive); // Ensure game is Active.
     require!(amount >= 50_000_000, ErrorCode::MinDeposit); // 0.05 SOL minimum
 
@@ -96,14 +97,26 @@ pub mod jackpot_program {
   pub fn end_round(ctx: Context<EndRound>) -> Result<()> {
     let pot = &mut ctx.accounts.pot;
     let clock = Clock::get()?;
+
     require!(pot.game_state == GameState::Active, ErrorCode::InvalidState); // Ensure game is Active
     require!(
       clock.unix_timestamp - pot.last_reset >= Pot::ACTIVE_DURATION,
       ErrorCode::CooldownActive
     ); // Active past than ACTIVE_DURATION
 
-    // TODO: Generate Pseudo-Randomness to select winner.
+    // Generate Pseudo-Randomness by hashing together some on-chain data...
+    let seed_data = [
+      pot.key().to_bytes().as_ref(),       // Pot PDA
+      &clock.unix_timestamp.to_le_bytes(), // Current Time
+      &pot.total_amount.to_le_bytes(),     // Pot size
+      &[pot.bump],                         // Pot bump
+    ]
+    .concat();
+    let random_hash = hash(&seed_data);
+    pot.randomness = Some(random_hash.to_bytes());
 
+    // WARNING: Remove the hash msg! in production
+    msg!("Pseudo-random hash: {:?}", random_hash);
     pot.end_game_caller = Some(ctx.accounts.caller.key());
     pot.game_state = GameState::Cooldown;
     msg!("Round ended; Game state set to Cooldown");
@@ -114,6 +127,7 @@ pub mod jackpot_program {
   // clears deposits, and updates the last_reset timestamp.
   pub fn distribute_rewards(ctx: Context<DistributeRewards>) -> Result<()> {
     let pot = &mut ctx.accounts.pot;
+
     require!(
       pot.game_state == GameState::Cooldown,
       ErrorCode::InvalidState
@@ -124,6 +138,7 @@ pub mod jackpot_program {
 
     // Select a winner using the randomness result
     let randomness = pot.randomness.unwrap();
+    // Take the first byte mod the length of deposits
     let winner_index = (randomness[0] as usize) % pot.deposits.len();
     let winner = pot.deposits[winner_index].depositor;
 
