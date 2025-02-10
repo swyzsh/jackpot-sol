@@ -6,7 +6,6 @@ use anchor_lang::solana_program::{
 use dotenvy::dotenv;
 use solana_program::hash::hash;
 use std::env;
-use std::str::FromStr;
 
 fn get_pubkey_from_env(var_name: &str) -> Pubkey {
   env::var(var_name)
@@ -15,10 +14,10 @@ fn get_pubkey_from_env(var_name: &str) -> Pubkey {
     .expect(&format!("Invalid pubkey format for {}", var_name))
 }
 
-declare_id!("HtbKartrbcGdW3wfhV2WsZVE4ybHhkKqWUr7V6PwEgfZ");
+declare_id!("9ux74QJi5pxgXNnBo3n16YCVj8GM6MDVyYpuLSfV2uSJ");
 
 #[program]
-pub mod jackpot_program {
+pub mod jackpot {
   use super::*;
 
   // Initialize the Pot account.
@@ -133,10 +132,21 @@ pub mod jackpot_program {
       ErrorCode::InvalidState
     ); // Ensure game is in Cooldown
     require!(pot.randomness.is_some(), ErrorCode::RandomnessNotAvailable); // Ensure randomness
-    let total_amount = pot.total_amount;
-    require!(total_amount > 0, ErrorCode::NoDeposits); // Ensure some deposits
+
+    // If no deposits, skip distributiona.
+    if pot.total_amount == 0 || pot.deposits.is_empty() {
+      msg!("No deposits found; Skipping distribution. Resetting pot state...");
+      pot.game_state = GameState::Inactive;
+      pot.total_amount = 0;
+      pot.deposits.clear();
+      pot.randomness = None;
+      pot.end_game_caller = None;
+      pot.last_reset = Clock::get()?.unix_timestamp;
+      return Ok(());
+    }
 
     // Select a winner using the randomness result
+    let total_amount = pot.total_amount;
     let randomness = pot.randomness.unwrap();
     // Take the first byte mod the length of deposits
     let winner_index = (randomness[0] as usize) % pot.deposits.len();
@@ -179,7 +189,7 @@ pub mod jackpot_program {
     pot.end_game_caller = None;
     pot.last_reset = Clock::get()?.unix_timestamp;
     msg!("Rewards distributed; Game state reset to Inactive");
-    Ok(())
+    return Ok(());
   }
 }
 
