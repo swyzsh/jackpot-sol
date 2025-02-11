@@ -5,6 +5,8 @@ import { Jackpot } from "../target/types/jackpot";
 
 const ACTIVE_DURATION = 120;
 const COOLDOWN_DURATION = 360;
+const BUYBACK_ADDY: string = "4o91wiYAsmtnpHbyaobF9q1vmswhY8kKKoSej8qtkRqv";
+const FEE_ADDY: string = "A3VipY34fosfdigEx4dDHjdwaaj1AnwrNgjbbGZuL7Y9";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -80,19 +82,48 @@ async function runScheduler() {
           break;
         case "cooldown":
           if (pot.randomness) {
+            if (!pot.winner) {
+              console.log(
+                "No winner found; Skipping distribution; Calling reset_pot_if_no_winner..."
+              );
+              try {
+                const tx = await program.methods
+                  .resetPotIfNoWinner()
+                  .accounts({ pot: POT_PDA })
+                  .rpc();
+                console.log(
+                  "Pot reset completed; Game state set to Inactive for next round. Tx Signature:",
+                  tx
+                );
+              } catch (err) {
+                console.error("Failed reset_pot_if_no_winner:", err);
+              }
+              break;
+            }
+
             console.log(
               "Randomness available. Attempting to distribute rewards..."
             );
-            const tx = await program.methods
-              .distributeRewards()
-              .accounts({
-                systemProgram: SystemProgram.programId,
-              })
-              .rpc();
-            console.log(
-              "DistributeRewards completed; Game state reset to Inactive. Tx Signature:",
-              tx
-            );
+
+            try {
+              // const buybackPubkey = new PublicKey(BUYBACK_ADDY);
+              // const feePubkey = new PublicKey(FEE_ADDY);
+              const winnerPubkey = new PublicKey(pot.winner);
+              const callerPubkey = new PublicKey(pot.endGameCaller);
+              const tx = await program.methods
+                .distributeRewards()
+                .accounts({
+                  winner: winnerPubkey,
+                  caller: callerPubkey,
+                })
+                .rpc();
+              console.log(
+                "DistributeRewards completed; Game state reset to Inactive. Tx Signature:",
+                tx
+              );
+            } catch (err) {
+              console.error("Failed to distribute rewards:", err);
+            }
           } else {
             console.log(
               "Game in cooldown; waiting for randomness fulfillment..."

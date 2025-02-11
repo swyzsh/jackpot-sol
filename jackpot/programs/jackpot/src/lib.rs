@@ -3,16 +3,11 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{
   program::invoke_signed, system_instruction, sysvar::clock::Clock,
 };
-use dotenvy::dotenv;
 use solana_program::hash::hash;
-use std::env;
+use std::str::FromStr;
 
-fn get_pubkey_from_env(var_name: &str) -> Pubkey {
-  env::var(var_name)
-    .expect(&format!("{} is not set", var_name))
-    .parse::<Pubkey>()
-    .expect(&format!("Invalid pubkey format for {}", var_name))
-}
+const BUYBACK_ADDY: &str = "4o91wiYAsmtnpHbyaobF9q1vmswhY8kKKoSej8qtkRqv";
+const FEE_ADDY: &str = "A3VipY34fosfdigEx4dDHjdwaaj1AnwrNgjbbGZuL7Y9";
 
 declare_id!("9ux74QJi5pxgXNnBo3n16YCVj8GM6MDVyYpuLSfV2uSJ");
 
@@ -34,7 +29,8 @@ pub mod jackpot {
     pot.total_amount = 0;
     pot.deposits = vec![];
     pot.end_game_caller = None;
-    Ok(())
+    pot.winner = None;
+    return Ok(());
   }
 
   // Starts a new round. Can only be called when the game is Inactive
@@ -55,7 +51,7 @@ pub mod jackpot {
     pot.game_state = GameState::Active;
     pot.last_reset = clock.unix_timestamp;
     msg!("Round started at: {}", pot.last_reset);
-    Ok(())
+    return Ok(());
   }
 
   // Accepts a deposit from a user.
@@ -87,12 +83,12 @@ pub mod jackpot {
     });
     pot.total_amount += amount;
     msg!("Deposits of {} lamports accepted", amount);
-    Ok(())
+    return Ok(());
   }
 
-  // Ends the current round.
-  // Can only be called if the round was Active for at least ACTIVE_DURATION seconds.
-  // This triggers a randomness request and sets the game state to Cooldown.
+  // Ends the current round; Can only be called if the round was Active for
+  // at least ACTIVE_DURATION seconds. This triggers a randomness request,
+  // selects and stores the winner address and sets the game state to Cooldown.
   pub fn end_round(ctx: Context<EndRound>) -> Result<()> {
     let pot = &mut ctx.accounts.pot;
     let clock = Clock::get()?;
@@ -117,13 +113,49 @@ pub mod jackpot {
     // WARNING: Remove the hash msg! in production
     msg!("Pseudo-random hash: {:?}", random_hash);
     pot.end_game_caller = Some(ctx.accounts.caller.key());
+
+    // Select a winner
+    if pot.total_amount > 0 && !pot.deposits.is_empty() {
+      let winner_index = (random_hash.to_bytes()[0] as usize) % pot.deposits.len();
+      let winner_pubkey = pot.deposits[winner_index].depositor;
+      msg!("Selected winner: {}", winner_pubkey);
+      pot.winner = Some(winner_pubkey);
+    } else {
+      pot.winner = None;
+    }
+
     pot.game_state = GameState::Cooldown;
     msg!("Round ended; Game state set to Cooldown");
     Ok(())
   }
 
-  // Distributes rewards based on the randomness, resets the game state,
-  // clears deposits, and updates the last_reset timestamp.
+  // Resets the pot if the pot is in Cooldown and there is no winner.
+  pub fn reset_pot_if_no_winner(ctx: Context<ResetPotIfNoWinner>) -> Result<()> {
+    let pot = &mut ctx.accounts.pot;
+
+    require!(
+      pot.game_state == GameState::Cooldown,
+      ErrorCode::InvalidState
+    );
+    require!(pot.winner.is_none(), ErrorCode::InvalidWinnerAccount);
+    require!(
+      pot.total_amount == 0 || pot.deposits.is_empty(),
+      ErrorCode::PotNotEmpty
+    );
+
+    // Reset the pot for next round.
+    msg!("No winners this round; resetting state to inactive.");
+    pot.game_state = GameState::Inactive;
+    pot.total_amount = 0;
+    pot.deposits.clear();
+    pot.randomness = None;
+    pot.end_game_caller = None;
+    pot.winner = None;
+    pot.last_reset = Clock::get()?.unix_timestamp;
+    return Ok(());
+  }
+
+  // Distributes rewards and reset the game state
   pub fn distribute_rewards(ctx: Context<DistributeRewards>) -> Result<()> {
     let pot = &mut ctx.accounts.pot;
 
@@ -133,46 +165,89 @@ pub mod jackpot {
     ); // Ensure game is in Cooldown
     require!(pot.randomness.is_some(), ErrorCode::RandomnessNotAvailable); // Ensure randomness
 
-    // If no deposits, skip distributiona.
-    if pot.total_amount == 0 || pot.deposits.is_empty() {
+    // If no deposits or no winner, skip distributiona.
+    if pot.total_amount == 0 || pot.deposits.is_empty() || pot.winner.is_none() {
       msg!("No deposits found; Skipping distribution. Resetting pot state...");
       pot.game_state = GameState::Inactive;
       pot.total_amount = 0;
       pot.deposits.clear();
       pot.randomness = None;
       pot.end_game_caller = None;
+      pot.winner = None;
       pot.last_reset = Clock::get()?.unix_timestamp;
       return Ok(());
     }
 
-    // Select a winner using the randomness result
     let total_amount = pot.total_amount;
-    let randomness = pot.randomness.unwrap();
-    // Take the first byte mod the length of deposits
-    let winner_index = (randomness[0] as usize) % pot.deposits.len();
-    let winner = pot.deposits[winner_index].depositor;
-
     let winner_amount = total_amount * 969 / 1000;
     let buyback_amount = total_amount * 25 / 1000;
     let fee_amount = total_amount * 5 / 1000;
     let caller_bonus = total_amount * 1 / 1000;
 
-    dotenv().ok(); // Load .env variables
-    let buyback_address = get_pubkey_from_env("BUYBACK_ADDRESS");
-    let fee_address = get_pubkey_from_env("FEE_ADDRESS");
-    let caller_address = pot.end_game_caller.unwrap();
+    let buyback_address =
+      Pubkey::from_str(BUYBACK_ADDY).expect("Hardcoded buyback address is invalid");
+    let fee_address = Pubkey::from_str(FEE_ADDY).expect("Hardcoded fee address is invalid");
 
-    let transfers = vec![
-      (winner, winner_amount),
-      (buyback_address, buyback_amount),
-      (fee_address, fee_amount),
-      (caller_address, caller_bonus),
+    let stored_winner = match pot.winner {
+      Some(pw) => pw,
+      None => {
+        msg!("No winner found; Skipping distribution.");
+        // Reset the pot for next round.
+        pot.game_state = GameState::Inactive;
+        pot.total_amount = 0;
+        pot.deposits.clear();
+        pot.randomness = None;
+        pot.end_game_caller = None;
+        pot.winner = None;
+        pot.last_reset = Clock::get()?.unix_timestamp;
+        return Ok(());
+      }
+    };
+
+    let stored_caller = match pot.end_game_caller {
+      Some(sc) => sc,
+      None => {
+        msg!("No end_game_caller found; Skipping distribution.");
+        // Reset the pot for next round.
+        pot.game_state = GameState::Inactive;
+        pot.total_amount = 0;
+        pot.deposits.clear();
+        pot.randomness = None;
+        pot.end_game_caller = None;
+        pot.winner = None;
+        pot.last_reset = Clock::get()?.unix_timestamp;
+        return Ok(());
+      }
+    };
+
+    require!(
+      ctx.accounts.winner.key() == stored_winner,
+      ErrorCode::InvalidWinnerAccount
+    );
+    require!(
+      ctx.accounts.caller.key() == stored_caller,
+      ErrorCode::InvalidCallerAccount
+    );
+    require!(
+      ctx.accounts.buyback.key() == buyback_address,
+      ErrorCode::InvalidBuybackAccount
+    );
+    require!(
+      ctx.accounts.fee.key() == fee_address,
+      ErrorCode::InvalidFeeAccount
+    );
+
+    let transfer_list = vec![
+      (ctx.accounts.winner.key(), winner_amount),
+      (ctx.accounts.buyback.key(), buyback_amount),
+      (ctx.accounts.fee.key(), fee_amount),
+      (ctx.accounts.caller.key(), caller_bonus),
     ];
 
-    for (recipient, amount) in transfers {
-      let transfer_ix = system_instruction::transfer(&pot.key(), &recipient, amount);
+    for (recipient_pubkey, lamports) in transfer_list {
+      let ix = system_instruction::transfer(&pot.key(), &recipient_pubkey, lamports);
       invoke_signed(
-        &transfer_ix,
+        &ix,
         &[
           pot.to_account_info(),
           ctx.accounts.system_program.to_account_info(),
@@ -187,8 +262,50 @@ pub mod jackpot {
     pot.deposits.clear();
     pot.randomness = None;
     pot.end_game_caller = None;
+    pot.winner = None;
     pot.last_reset = Clock::get()?.unix_timestamp;
     msg!("Rewards distributed; Game state reset to Inactive");
+    return Ok(());
+  }
+
+  // Ensure the game is NOT in Active state to avoid interfering with an active round
+  pub fn admin_withdraw(ctx: Context<AdminWithdraw>) -> Result<()> {
+    let pot = &mut ctx.accounts.pot;
+
+    require!(
+      pot.game_state != GameState::Active,
+      ErrorCode::CannotWithdrawDuringActive
+    );
+
+    let pot_lamports = pot.to_account_info().lamports();
+    msg!("Admin withdraw: pot has {} lamports", pot_lamports);
+
+    let fee_address = Pubkey::from_str(FEE_ADDY).expect("Hardcoded fee address invalid");
+
+    if pot_lamports > 0 {
+      let ix = system_instruction::transfer(&pot.key(), &fee_address, pot_lamports);
+      invoke_signed(
+        &ix,
+        &[
+          pot.to_account_info(),
+          ctx.accounts.system_program.to_account_info(),
+        ],
+        &[],
+      )?;
+      msg!(
+        "Transferred {} lamports from Pot PDA to Fee address.",
+        pot_lamports
+      );
+    } else {
+      msg!("Pot has 0 lamports; skipping transfer.");
+    }
+
+    // Reset the deposits for next round.
+    pot.total_amount = 0;
+    pot.deposits.clear();
+    // pot.randomness = None;
+    // pot.end_game_caller = None;
+    // pot.winner = None;
     return Ok(());
   }
 }
@@ -232,9 +349,56 @@ pub struct EndRound<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ResetPotIfNoWinner<'info> {
+  #[account(mut, seeds = [b"pot"], bump)]
+  pub pot: Account<'info, Pot>,
+  // // If want only admin to be able to do this, keep it:
+  // #[account(mut)]
+  // pub admin: Signer<'info>,
+  pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct DistributeRewards<'info> {
   #[account(mut, seeds = [b"pot"], bump)]
   pub pot: Account<'info, Pot>,
+
+  // The winner from pot.winner
+  #[account(mut)]
+  /// CHECK: We verify in code that `winner.key() == pot.winner`
+  pub winner: UncheckedAccount<'info>,
+
+  // The end_game_caller from pot.end_game_caller
+  #[account(mut)]
+  /// CHECK: We verify in code that `caller.key() == pot.end_game_caller`
+  pub caller: UncheckedAccount<'info>,
+
+  // Hardcoded buyback
+  #[account(mut, address = Pubkey::from_str(BUYBACK_ADDY).unwrap())]
+  /// CHECK: We check this matches the const above
+  pub buyback: UncheckedAccount<'info>,
+
+  // Hardcoded fee
+  #[account(mut, address = Pubkey::from_str(FEE_ADDY).unwrap())]
+  /// CHECK: We check this matches the const above
+  pub fee: UncheckedAccount<'info>,
+
+  pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AdminWithdraw<'info> {
+  #[account(mut, seeds = [b"pot"], bump)]
+  pub pot: Account<'info, Pot>,
+
+  // Ensure ADMIN only.
+  #[account(mut)]
+  pub admin: Signer<'info>,
+
+  #[account(mut, address = Pubkey::from_str(FEE_ADDY).unwrap())]
+  /// CHECK: We trust this is the correct fee address
+  pub fee: UncheckedAccount<'info>,
+
   pub system_program: Program<'info, System>,
 }
 
@@ -248,6 +412,7 @@ pub struct Pot {
   pub last_reset: i64,
   pub randomness: Option<[u8; 32]>,
   pub end_game_caller: Option<Pubkey>,
+  pub winner: Option<Pubkey>,
 }
 
 impl Pot {
@@ -271,10 +436,28 @@ pub enum GameState {
 
 #[error_code]
 pub enum ErrorCode {
+  #[msg("Game is not active.")]
   GameInactive,
+  #[msg("Minimum deposit not met.")]
   MinDeposit,
+  #[msg("Invalid state for operation.")]
   InvalidState,
+  #[msg("Cooldown still active.")]
   CooldownActive,
+  #[msg("No deposits found.")]
   NoDeposits,
+  #[msg("Randomness not available.")]
   RandomnessNotAvailable,
+  #[msg("Winner account does not match pot.winner")]
+  InvalidWinnerAccount,
+  #[msg("Pot is not empty; cannot reset.")]
+  PotNotEmpty,
+  #[msg("Caller account does not match pot.end_game_caller")]
+  InvalidCallerAccount,
+  #[msg("Buyback account does not match the hardcoded address")]
+  InvalidBuybackAccount,
+  #[msg("Fee account does not match the hardcoded address")]
+  InvalidFeeAccount,
+  #[msg("Cannot withdraw while game is active.")]
+  CannotWithdrawDuringActive,
 }
