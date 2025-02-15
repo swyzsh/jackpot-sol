@@ -8,13 +8,13 @@ const FEE_ADDY: string = "A3VipY34fosfdigEx4dDHjdwaaj1AnwrNgjbbGZuL7Y9";
 async function withdrawPot() {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
-  // const program = new anchor.Program<Jackpot>(idl as Jackpot, provider);
-  const program = anchor.workspace.Jackpot;
-  if (!program) {
-    throw new Error(
-      "Program not found in workspace. Did you build your program?"
-    );
-  }
+  const program = new anchor.Program<Jackpot>(idl as Jackpot, provider);
+  // const program = anchor.workspace.Jackpot;
+  // if (!program) {
+  //   throw new Error(
+  //     "Program not found in workspace. Did you build your program?"
+  //   );
+  // }
   console.log("Program ID:", program.programId.toBase58());
 
   const [POT_PDA, bump] = PublicKey.findProgramAddressSync(
@@ -31,11 +31,8 @@ async function withdrawPot() {
     const tx = await program.methods
       .adminWithdraw()
       .accounts({
-        pot: POT_PDA,
         admin: provider.wallet.publicKey,
-        fee: feePubkey,
-        systemProgram: SystemProgram.programId,
-      } as any)
+      })
       .rpc();
     console.log("Emergency withdraw successful. Tx:", tx);
   } catch (err) {

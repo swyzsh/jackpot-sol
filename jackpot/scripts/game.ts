@@ -1,5 +1,5 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, SystemProgram } from "@solana/web3.js";
+import { Connection, PublicKey, SystemProgram } from "@solana/web3.js";
 import * as idl from "../target/idl/jackpot.json";
 import { Jackpot } from "../target/types/jackpot";
 
@@ -105,18 +105,25 @@ async function runScheduler() {
               "Randomness available. Attempting to distribute rewards..."
             );
 
+            console.log("Pot Winner:", pot.winner?.toBase58());
+
             try {
-              // const buybackPubkey = new PublicKey(BUYBACK_ADDY);
-              // const feePubkey = new PublicKey(FEE_ADDY);
-              const winnerPubkey = new PublicKey(pot.winner);
-              const callerPubkey = new PublicKey(pot.endGameCaller);
+              const buybackPubkey = new PublicKey(BUYBACK_ADDY);
+              const feePubkey = new PublicKey(FEE_ADDY);
+              const winnerPubkey = new PublicKey(pot.winner!);
+
               const tx = await program.methods
                 .distributeRewards()
                 .accounts({
                   winner: winnerPubkey,
-                  caller: callerPubkey,
+                  buyback: buybackPubkey,
+                  fee: feePubkey,
                 })
-                .rpc();
+                .signers([])
+                .rpc({
+                  commitment: "confirmed",
+                  preflightCommitment: "confirmed",
+                });
               console.log(
                 "DistributeRewards completed; Game state reset to Inactive. Tx Signature:",
                 tx

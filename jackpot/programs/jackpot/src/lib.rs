@@ -4,12 +4,13 @@ use anchor_lang::solana_program::{
   program::invoke_signed, system_instruction, sysvar::clock::Clock,
 };
 use solana_program::hash::hash;
+use solana_program::rent::Rent;
 use std::str::FromStr;
 
 const BUYBACK_ADDY: &str = "4o91wiYAsmtnpHbyaobF9q1vmswhY8kKKoSej8qtkRqv";
 const FEE_ADDY: &str = "A3VipY34fosfdigEx4dDHjdwaaj1AnwrNgjbbGZuL7Y9";
 
-declare_id!("9ux74QJi5pxgXNnBo3n16YCVj8GM6MDVyYpuLSfV2uSJ");
+declare_id!("AnrihJB9TT6WH12NPbch53KDrxQfzX5PrG1qDdnTcRiQ");
 
 #[program]
 pub mod jackpot {
@@ -28,7 +29,6 @@ pub mod jackpot {
     pot.last_reset = Clock::get()?.unix_timestamp;
     pot.total_amount = 0;
     pot.deposits = vec![];
-    pot.end_game_caller = None;
     pot.winner = None;
     return Ok(());
   }
@@ -112,7 +112,6 @@ pub mod jackpot {
 
     // WARNING: Remove the hash msg! in production
     msg!("Pseudo-random hash: {:?}", random_hash);
-    pot.end_game_caller = Some(ctx.accounts.caller.key());
 
     // Select a winner
     if pot.total_amount > 0 && !pot.deposits.is_empty() {
@@ -138,10 +137,6 @@ pub mod jackpot {
       ErrorCode::InvalidState
     );
     require!(pot.winner.is_none(), ErrorCode::InvalidWinnerAccount);
-    require!(
-      pot.total_amount == 0 || pot.deposits.is_empty(),
-      ErrorCode::PotNotEmpty
-    );
 
     // Reset the pot for next round.
     msg!("No winners this round; resetting state to inactive.");
@@ -149,7 +144,6 @@ pub mod jackpot {
     pot.total_amount = 0;
     pot.deposits.clear();
     pot.randomness = None;
-    pot.end_game_caller = None;
     pot.winner = None;
     pot.last_reset = Clock::get()?.unix_timestamp;
     return Ok(());
@@ -159,101 +153,78 @@ pub mod jackpot {
   pub fn distribute_rewards(ctx: Context<DistributeRewards>) -> Result<()> {
     let pot = &mut ctx.accounts.pot;
 
+    // Ensure game is in Cooldown and Randomness is available.
     require!(
       pot.game_state == GameState::Cooldown,
       ErrorCode::InvalidState
-    ); // Ensure game is in Cooldown
-    require!(pot.randomness.is_some(), ErrorCode::RandomnessNotAvailable); // Ensure randomness
+    );
+    require!(pot.randomness.is_some(), ErrorCode::RandomnessNotAvailable);
 
-    // If no deposits or no winner, skip distributiona.
+    // If no deposits or no winner, skip distributiona and reset pot.
     if pot.total_amount == 0 || pot.deposits.is_empty() || pot.winner.is_none() {
       msg!("No deposits found; Skipping distribution. Resetting pot state...");
       pot.game_state = GameState::Inactive;
       pot.total_amount = 0;
       pot.deposits.clear();
       pot.randomness = None;
-      pot.end_game_caller = None;
       pot.winner = None;
       pot.last_reset = Clock::get()?.unix_timestamp;
       return Ok(());
     }
 
-    let total_amount = pot.total_amount;
-    let winner_amount = total_amount * 969 / 1000;
-    let buyback_amount = total_amount * 25 / 1000;
-    let fee_amount = total_amount * 5 / 1000;
-    let caller_bonus = total_amount * 1 / 1000;
-
-    let buyback_address =
-      Pubkey::from_str(BUYBACK_ADDY).expect("Hardcoded buyback address is invalid");
-    let fee_address = Pubkey::from_str(FEE_ADDY).expect("Hardcoded fee address is invalid");
-
-    let stored_winner = match pot.winner {
-      Some(pw) => pw,
-      None => {
-        msg!("No winner found; Skipping distribution.");
-        // Reset the pot for next round.
-        pot.game_state = GameState::Inactive;
-        pot.total_amount = 0;
-        pot.deposits.clear();
-        pot.randomness = None;
-        pot.end_game_caller = None;
-        pot.winner = None;
-        pot.last_reset = Clock::get()?.unix_timestamp;
-        return Ok(());
-      }
-    };
-
-    let stored_caller = match pot.end_game_caller {
-      Some(sc) => sc,
-      None => {
-        msg!("No end_game_caller found; Skipping distribution.");
-        // Reset the pot for next round.
-        pot.game_state = GameState::Inactive;
-        pot.total_amount = 0;
-        pot.deposits.clear();
-        pot.randomness = None;
-        pot.end_game_caller = None;
-        pot.winner = None;
-        pot.last_reset = Clock::get()?.unix_timestamp;
-        return Ok(());
-      }
-    };
-
+    let stored_winner = pot.winner.unwrap();
     require!(
       ctx.accounts.winner.key() == stored_winner,
       ErrorCode::InvalidWinnerAccount
     );
-    require!(
-      ctx.accounts.caller.key() == stored_caller,
-      ErrorCode::InvalidCallerAccount
-    );
+
+    let buyback_address =
+      Pubkey::from_str(BUYBACK_ADDY).expect("Hardcoded buyback address is invalid");
     require!(
       ctx.accounts.buyback.key() == buyback_address,
       ErrorCode::InvalidBuybackAccount
     );
+
+    let fee_address = Pubkey::from_str(FEE_ADDY).expect("Hardcoded fee address is invalid");
     require!(
       ctx.accounts.fee.key() == fee_address,
       ErrorCode::InvalidFeeAccount
     );
 
-    let transfer_list = vec![
-      (ctx.accounts.winner.key(), winner_amount),
-      (ctx.accounts.buyback.key(), buyback_amount),
-      (ctx.accounts.fee.key(), fee_amount),
-      (ctx.accounts.caller.key(), caller_bonus),
-    ];
+    // Calculate POT PDA's rent exempt minimum and safe gaurd from total_amount.
+    let rent = Rent::get()?;
+    let pot_account_info = pot.to_account_info();
+    let pot_account_size = pot_account_info.data_len();
+    let rent_exempt_minimum = rent.minimum_balance(pot_account_size);
+    let safe_guard: u64 = 100_000_000; // 0.1 sol
 
-    for (recipient_pubkey, lamports) in transfer_list {
-      let ix = system_instruction::transfer(&pot.key(), &recipient_pubkey, lamports);
-      invoke_signed(
-        &ix,
-        &[
-          pot.to_account_info(),
-          ctx.accounts.system_program.to_account_info(),
-        ],
-        &[],
-      )?;
+    // Calculate distributable amount after accounting for rent exempt and safe guard.
+    let total_amount = pot.total_amount;
+    let distributable_amount = total_amount
+      .checked_sub(rent_exempt_minimum)
+      .ok_or(ErrorCode::InsufficientFundsForRent)?;
+    let distributable_amount = distributable_amount
+      .checked_sub(safe_guard)
+      .ok_or(ErrorCode::InsufficientFundsForRent)?;
+
+    let winner_amount = distributable_amount * 970 / 1000;
+    let buyback_amount = distributable_amount * 25 / 1000;
+    let fee_amount = distributable_amount * 5 / 1000;
+
+    // PDA cannot do system CPI, so directly adjust lamports.
+    {
+      let winner_info = &mut ctx.accounts.winner.to_account_info();
+      let buyback_info = &mut ctx.accounts.buyback.to_account_info();
+      let fee_info = &mut ctx.accounts.fee.to_account_info();
+      // Transfer to winner.
+      **pot_account_info.try_borrow_mut_lamports()? -= winner_amount;
+      **winner_info.try_borrow_mut_lamports()? += winner_amount;
+      // Transfer to buyback.
+      **pot_account_info.try_borrow_mut_lamports()? -= buyback_amount;
+      **buyback_info.try_borrow_mut_lamports()? += buyback_amount;
+      // Transfer to fee.
+      **pot_account_info.try_borrow_mut_lamports()? -= fee_amount;
+      **fee_info.try_borrow_mut_lamports()? += fee_amount;
     }
 
     // Reset the pot for next round.
@@ -261,7 +232,6 @@ pub mod jackpot {
     pot.total_amount = 0;
     pot.deposits.clear();
     pot.randomness = None;
-    pot.end_game_caller = None;
     pot.winner = None;
     pot.last_reset = Clock::get()?.unix_timestamp;
     msg!("Rewards distributed; Game state reset to Inactive");
@@ -277,34 +247,28 @@ pub mod jackpot {
       ErrorCode::CannotWithdrawDuringActive
     );
 
+    let rent = Rent::get()?;
+    let min_rent = rent.minimum_balance(pot.to_account_info().data_len());
+
     let pot_lamports = pot.to_account_info().lamports();
     msg!("Admin withdraw: pot has {} lamports", pot_lamports);
 
-    let fee_address = Pubkey::from_str(FEE_ADDY).expect("Hardcoded fee address invalid");
-
-    if pot_lamports > 0 {
-      let ix = system_instruction::transfer(&pot.key(), &fee_address, pot_lamports);
-      invoke_signed(
-        &ix,
-        &[
-          pot.to_account_info(),
-          ctx.accounts.system_program.to_account_info(),
-        ],
-        &[],
-      )?;
+    if pot_lamports > min_rent {
+      let withdraw_amount = pot_lamports - min_rent;
+      **pot.to_account_info().try_borrow_mut_lamports()? = min_rent;
+      **ctx.accounts.fee.try_borrow_mut_lamports()? += withdraw_amount;
       msg!(
         "Transferred {} lamports from Pot PDA to Fee address.",
-        pot_lamports
+        withdraw_amount
       );
     } else {
-      msg!("Pot has 0 lamports; skipping transfer.");
+      msg!("Pot has insufficient lamports above rent-exempt minimum; skipping transfer.");
     }
 
     // Reset the deposits for next round.
     pot.total_amount = 0;
     pot.deposits.clear();
     // pot.randomness = None;
-    // pot.end_game_caller = None;
     // pot.winner = None;
     return Ok(());
   }
@@ -363,24 +327,18 @@ pub struct DistributeRewards<'info> {
   #[account(mut, seeds = [b"pot"], bump)]
   pub pot: Account<'info, Pot>,
 
-  // The winner from pot.winner
+  /// CHECK: Verified in code
   #[account(mut)]
-  /// CHECK: We verify in code that `winner.key() == pot.winner`
   pub winner: UncheckedAccount<'info>,
 
-  // The end_game_caller from pot.end_game_caller
-  #[account(mut)]
-  /// CHECK: We verify in code that `caller.key() == pot.end_game_caller`
-  pub caller: UncheckedAccount<'info>,
-
   // Hardcoded buyback
-  #[account(mut, address = Pubkey::from_str(BUYBACK_ADDY).unwrap())]
-  /// CHECK: We check this matches the const above
+  /// CHECK: Verified in code
+  #[account(mut)]
   pub buyback: UncheckedAccount<'info>,
 
   // Hardcoded fee
-  #[account(mut, address = Pubkey::from_str(FEE_ADDY).unwrap())]
-  /// CHECK: We check this matches the const above
+  /// CHECK: Verified in code
+  #[account(mut)]
   pub fee: UncheckedAccount<'info>,
 
   pub system_program: Program<'info, System>,
@@ -411,7 +369,6 @@ pub struct Pot {
   pub game_state: GameState,
   pub last_reset: i64,
   pub randomness: Option<[u8; 32]>,
-  pub end_game_caller: Option<Pubkey>,
   pub winner: Option<Pubkey>,
 }
 
@@ -450,14 +407,12 @@ pub enum ErrorCode {
   RandomnessNotAvailable,
   #[msg("Winner account does not match pot.winner")]
   InvalidWinnerAccount,
-  #[msg("Pot is not empty; cannot reset.")]
-  PotNotEmpty,
-  #[msg("Caller account does not match pot.end_game_caller")]
-  InvalidCallerAccount,
   #[msg("Buyback account does not match the hardcoded address")]
   InvalidBuybackAccount,
   #[msg("Fee account does not match the hardcoded address")]
   InvalidFeeAccount,
   #[msg("Cannot withdraw while game is active.")]
   CannotWithdrawDuringActive,
+  #[msg("Insufficient funds to leave rent-exempt")]
+  InsufficientFundsForRent,
 }
